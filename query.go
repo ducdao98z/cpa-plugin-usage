@@ -59,9 +59,10 @@ type chartPoint struct {
 }
 
 type detailsQuery struct {
-	page, pageSize int
-	provider       string
-	from, to       int64 // unix ms, 0 = open
+	page, pageSize   int
+	provider, apiKey string // apiKey is a masked client key
+	from, to         int64  // unix ms, 0 = open
+	snapshot         int    // newest rowid the pages show, 0 = the newest now
 }
 
 // periodStart returns the first unix ms of a period; now carries the viewer's time zone.
@@ -242,16 +243,32 @@ func (s *usageStore) chart(period string, now time.Time) ([]chartPoint, error) {
 	return points, nil
 }
 
-// details pages through matching records, newest request first.
+// details pages through matching records, newest request first. Later pages pass the snapshot the first
+// one returned, so requests arriving in between do not shift what they show.
 func (s *usageStore) details(q detailsQuery) (map[string]any, error) {
 	db, errDB := s.reader()
 	if errDB != nil {
 		return nil, errDB
 	}
+	// One read transaction: the snapshot, the count and the page see the same rows.
+	tx, errBegin := db.Begin()
+	if errBegin != nil {
+		return nil, errBegin
+	}
+	defer func() { _ = tx.Rollback() }()
 	var conds []string
 	var args []any
+	if q.snapshot > 0 {
+		// The unary + keeps SQLite on the ts index, which already gives the order.
+		conds, args = append(conds, "+rowid <= ?"), append(args, q.snapshot)
+	} else if errMax := tx.QueryRow("SELECT IFNULL(MAX(rowid), 0) FROM requests").Scan(&q.snapshot); errMax != nil {
+		return nil, errMax
+	}
 	if q.provider != "" {
 		conds, args = append(conds, "provider = ?"), append(args, q.provider)
+	}
+	if q.apiKey != "" {
+		conds, args = append(conds, "api_key = ?"), append(args, q.apiKey)
 	}
 	if q.from != 0 {
 		conds, args = append(conds, "ts >= ?"), append(args, q.from)
@@ -264,25 +281,26 @@ func (s *usageStore) details(q detailsQuery) (map[string]any, error) {
 		where = " WHERE " + strings.Join(conds, " AND ")
 	}
 	var total int
-	if errCount := db.QueryRow("SELECT COUNT(*) FROM requests"+where, args...).Scan(&total); errCount != nil {
+	if errCount := tx.QueryRow("SELECT COUNT(*) FROM requests"+where, args...).Scan(&total); errCount != nil {
 		return nil, errCount
 	}
-	items, errItems := scanRecords(db.Query("SELECT "+recordColumns+" FROM requests"+where+" ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
+	items, errItems := scanRecords(tx.Query("SELECT "+recordColumns+" FROM requests"+where+" ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
 		append(args, q.pageSize, (q.page-1)*q.pageSize)...))
 	if errItems != nil {
 		return nil, errItems
 	}
 	s.mu.Lock()
-	providers := sortedKeys(s.providers)
+	providers, apiKeys := sortedKeys(s.providers), sortedKeys(s.apiKeys)
 	s.mu.Unlock()
 
 	return map[string]any{
 		"details": items,
 		"pagination": map[string]int{
 			"page": q.page, "pageSize": q.pageSize, "totalItems": total,
-			"totalPages": (total + q.pageSize - 1) / q.pageSize,
+			"totalPages": (total + q.pageSize - 1) / q.pageSize, "snapshot": q.snapshot,
 		},
 		"providers": providers,
+		"apiKeys":   apiKeys,
 	}, nil
 }
 

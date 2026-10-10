@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -197,6 +198,47 @@ func TestOpenKeepsCountingWithoutTheDatabase(t *testing.T) {
 	s.addUsage(pluginapi.UsageRecord{Provider: "codex", Model: "gpt-5", Generate: true}, "", time.Now())
 	if page := must(s.details(detailsQuery{page: 1, pageSize: 10})); page["pagination"].(map[string]int)["totalItems"] != 1 {
 		t.Fatalf("in-memory history = %+v", page)
+	}
+}
+
+func TestDetailsSnapshotAndKeyFilter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	s := &usageStore{}
+	if errOpen := s.open(path); errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	defer s.close()
+	now := time.Now()
+	add := func(i int, key string) {
+		s.addUsage(pluginapi.UsageRecord{RequestID: strconv.Itoa(i), Provider: "codex", Model: "gpt-5", APIKey: key, Generate: true,
+			RequestedAt: now.Add(time.Duration(i) * time.Second)}, "", now)
+	}
+	for i := 0; i < 30; i++ {
+		add(i, "sk-aaaaaaaaaaaaaaaa")
+	}
+	first := must(s.details(detailsQuery{page: 1, pageSize: 10})) // 29..20
+	for i := 30; i < 45; i++ {
+		add(i, "sk-bbbbbbbbbbbbbbbb") // arrive while page 1 is read
+	}
+	second := must(s.details(detailsQuery{page: 2, pageSize: 10, snapshot: first["pagination"].(map[string]int)["snapshot"]}))
+	if items := second["details"].([]record); len(items) != 10 || items[0].ID != "19" || items[9].ID != "10" ||
+		second["pagination"].(map[string]int)["totalItems"] != 30 {
+		t.Fatalf("page 2 of the first page's snapshot = %+v", second)
+	}
+	if fresh := must(s.details(detailsQuery{page: 1, pageSize: 10})); fresh["details"].([]record)[0].ID != "44" {
+		t.Fatalf("page 1 without a snapshot = %+v", fresh["details"])
+	}
+
+	s.close()
+	if errOpen := s.open(path); errOpen != nil { // the key list is rebuilt from the database
+		t.Fatal(errOpen)
+	}
+	keyed := must(s.details(detailsQuery{page: 1, pageSize: 50, apiKey: maskKey("sk-bbbbbbbbbbbbbbbb")}))
+	if n := keyed["pagination"].(map[string]int)["totalItems"]; n != 15 {
+		t.Fatalf("apiKey filter matched %d records, want 15", n)
+	}
+	if keys := keyed["apiKeys"].([]string); len(keys) != 2 || keys[0] != "sk-aaaaa***aaaa" || keys[1] != "sk-bbbbb***bbbb" {
+		t.Fatalf("apiKeys = %v", keys)
 	}
 }
 

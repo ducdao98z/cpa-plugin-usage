@@ -112,6 +112,7 @@ type usageStore struct {
 	tail        []record              // newest records, oldest first
 	total       int                   // records stored
 	providers   map[string]bool       // every provider stored, for the Details filter
+	apiKeys     map[string]bool       // every masked client key stored, for the Details filter
 	paths       [patchWindow]pathNote // recent trace -> request path, for usage that arrives after it
 	pathPos     int
 	errProvider string
@@ -172,20 +173,20 @@ func openDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// loadLocked reads what stays in memory: the record count, the providers and the newest records.
+// loadLocked reads what stays in memory: the record count, the providers and keys, and the newest records.
 func (s *usageStore) loadLocked() error {
-	s.total, s.providers, s.tail = 0, map[string]bool{}, nil
+	s.total, s.providers, s.apiKeys, s.tail = 0, map[string]bool{}, map[string]bool{}, nil
 	if errCount := s.db.QueryRow("SELECT COUNT(*) FROM requests").Scan(&s.total); errCount != nil {
 		return errCount
 	}
-	rows, errQuery := s.db.Query("SELECT DISTINCT provider FROM requests WHERE provider != ''")
+	rows, errQuery := s.db.Query("SELECT DISTINCT provider, api_key FROM requests")
 	if errQuery != nil {
 		return errQuery
 	}
 	for rows.Next() {
-		var provider string
-		if rows.Scan(&provider) == nil {
-			s.providers[provider] = true
+		var provider, apiKey string
+		if rows.Scan(&provider, &apiKey) == nil {
+			s.noteLocked(provider, apiKey)
 		}
 	}
 	errRows := rows.Err()
@@ -343,11 +344,19 @@ func (s *usageStore) addUsage(u pluginapi.UsageRecord, account string, now time.
 	if len(s.tail) > 2*tailSize {
 		s.tail = slices.Clone(s.tail[len(s.tail)-tailSize:]) // trim now and then, not on every request
 	}
-	if rec.Provider != "" {
-		s.providers[rec.Provider] = true
-	}
+	s.noteLocked(rec.Provider, rec.APIKey)
 	if rec.Failed && rec.Provider != "" {
 		s.errProvider, s.errAt = strings.ToLower(rec.Provider), rec.arrived
+	}
+}
+
+// noteLocked adds a record's provider and masked key to the Details filter lists.
+func (s *usageStore) noteLocked(provider, apiKey string) {
+	if provider != "" {
+		s.providers[provider] = true
+	}
+	if apiKey != "" {
+		s.apiKeys[apiKey] = true
 	}
 }
 

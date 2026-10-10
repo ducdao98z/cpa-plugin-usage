@@ -384,7 +384,7 @@ tr.child td:first-child::before { content: ""; position: absolute; left: 22px; t
 .pagerCtl { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; }
 .pages { display: flex; align-items: center; gap: 4px; }
 .pageSize { display: flex; align-items: center; gap: 8px; }
-.filters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; align-items: end; gap: 16px; }
+.filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) auto; align-items: end; gap: 16px; }
 .logsWrap { max-height: 640px; overflow: auto; }
 .logsWrap thead th { position: sticky; top: 0; z-index: 1; }
 .logsWrap td { padding: 7px 14px; font-size: 12.5px; }
@@ -512,6 +512,7 @@ const ICONS = {
 };
 
 const query = new URLSearchParams(location.search);
+const NO_FILTERS = Object.freeze({ provider: "", apiKey: "", startDate: "", endDate: "" });
 const state = {
   key: "", keySource: "",
   tab: tabFromUrl(),
@@ -522,7 +523,7 @@ const state = {
   provMode: "tokens", modelMode: "tokens",
   animate: { chart: true, bars: true, wire: true },
   keyNames: {}, newestSeen: 0,
-  details: { items: [], pagination: { page: 1, pageSize: 20, totalItems: 0, totalPages: 0 }, providers: [], filters: { provider: "", startDate: "", endDate: "" }, loading: false, seq: 0 },
+  details: { items: [], pagination: { page: 1, pageSize: 20, totalItems: 0, totalPages: 0 }, providers: [], apiKeys: [], filters: { ...NO_FILTERS }, loading: false, seq: 0 },
   logs: { items: [], loading: true, auto: true },
 };
 const ui = {}; // element refs filled by build()
@@ -713,6 +714,7 @@ async function loadKeyNames() {
   }
   if (JSON.stringify(found) === JSON.stringify(state.keyNames)) return;
   state.keyNames = found;
+  renderFilters();
   if (state.derived) { renderHero(); renderTable(); }
 }
 function keyLabel(masked) {
@@ -1069,15 +1071,23 @@ async function loadStats(quiet) {
   }
   if (!ui.overview.hidden) renderOverview();
 }
+// New requests refresh every number quietly. A refresh scans the whole period (seconds on a long history),
+// so the next one waits for it and then rests 4x as long as it took, instead of piling up under traffic.
+const refresh = { due: false, busy: false, next: 0 };
 async function pollLive() {
   if (document.hidden || !state.stats) return;
   try {
     const live = await api("/live");
-    const changed = live.total !== state.stats.total;
+    if (live.total !== state.stats.total) refresh.due = true;
     Object.assign(state.stats, live);
     renderHero(); updateSolar(); renderRecent();
-    if (changed) { loadStats(true); loadChart(true); } // new requests: refresh every number quietly
   } catch {}
+  if (!refresh.due || refresh.busy || Date.now() < refresh.next) return;
+  refresh.due = false; refresh.busy = true;
+  const started = Date.now();
+  await Promise.all([loadStats(true), loadChart(true)]);
+  refresh.busy = false;
+  refresh.next = Date.now() + 4 * (Date.now() - started);
 }
 function renderOverview() {
   renderHero();
@@ -1489,7 +1499,7 @@ function bindSolar() {
   document.addEventListener("visibilitychange", startSolar);
 }
 function openProvider(p) {
-  state.details.filters = { provider: p, startDate: "", endDate: "" };
+  state.details.filters = { ...NO_FILTERS, provider: p };
   state.details.pagination.page = 1;
   renderFilters();
   setQuery({ tab: "details" }, true);
@@ -1821,8 +1831,8 @@ function buildDetails() {
 function renderFilters() {
   if (!ui.filters) return;
   const f = state.details.filters;
-  const isEmpty = () => !f.provider && !f.startDate && !f.endDate;
-  const clear = h("button", { type: "button", class: "btn", onclick: () => { state.details.filters = { provider: "", startDate: "", endDate: "" }; state.details.pagination.page = 1; renderFilters(); loadDetails(); } }, "Clear filters");
+  const isEmpty = () => Object.keys(NO_FILTERS).every(k => !f[k]);
+  const clear = h("button", { type: "button", class: "btn", onclick: () => { state.details.filters = { ...NO_FILTERS }; state.details.pagination.page = 1; renderFilters(); loadDetails(); } }, "Clear filters");
   clear.disabled = isEmpty();
   // Inputs stay in place while filtering so a half-edited date keeps focus.
   const change = (k, v) => { f[k] = v; state.details.pagination.page = 1; clear.disabled = isEmpty(); loadDetails(); };
@@ -1830,9 +1840,14 @@ function renderFilters() {
   const provider = h("select", { id: "provider-filter", class: "input", onchange: e => change("provider", e.target.value) },
     h("option", { value: "" }, "All providers"), providers.map(p => h("option", { value: p }, providerMeta(p).name)));
   provider.value = f.provider;
+  const keys = [...new Set([...state.details.apiKeys, f.apiKey].filter(Boolean))];
+  const apiKey = h("select", { id: "api-key-filter", class: "input", onchange: e => change("apiKey", e.target.value) },
+    h("option", { value: "" }, "All API keys"), keys.map(k => h("option", { value: k }, state.keyNames[k] ? `${state.keyNames[k]} · ${k}` : k)));
+  apiKey.value = f.apiKey;
   const date = (id, k) => h("input", { id, type: "datetime-local", class: "input", value: f[k], onchange: e => change(k, e.target.value) });
   ui.filters.replaceChildren(
     h("div", { class: "field" }, h("label", { for: "provider-filter" }, "Provider"), provider),
+    h("div", { class: "field" }, h("label", { for: "api-key-filter" }, "API key"), apiKey),
     h("div", { class: "field" }, h("label", { for: "start-date-filter" }, "From"), date("start-date-filter", "startDate")),
     h("div", { class: "field" }, h("label", { for: "end-date-filter" }, "To"), date("end-date-filter", "endDate")),
     clear);
@@ -1842,6 +1857,9 @@ async function loadDetails() {
   d.loading = true; renderDetailsTable();
   const params = { page: d.pagination.page, pageSize: d.pagination.pageSize };
   if (d.filters.provider) params.provider = d.filters.provider;
+  if (d.filters.apiKey) params.apiKey = d.filters.apiKey;
+  // Page 1 takes a new snapshot; later pages keep it, so requests arriving meanwhile do not shift them.
+  if (d.pagination.page > 1 && d.pagination.snapshot) params.snapshot = d.pagination.snapshot;
   if (d.filters.startDate) params.from = new Date(d.filters.startDate).toISOString();
   if (d.filters.endDate) params.to = new Date(d.filters.endDate).toISOString();
   try {
@@ -1849,9 +1867,10 @@ async function loadDetails() {
     if (seq !== d.seq) return;
     d.items = res.details || [];
     d.pagination = { ...d.pagination, ...res.pagination };
-    const known = d.providers.join(",");
+    const known = [d.providers, d.apiKeys].join("|");
     d.providers = res.providers || [];
-    if (known !== d.providers.join(",")) renderFilters();
+    d.apiKeys = res.apiKeys || [];
+    if (known !== [d.providers, d.apiKeys].join("|")) renderFilters();
   } catch (e) {
     if (seq !== d.seq) return;
     if (e.message !== "unauthorized") console.error("Failed to fetch request details:", e);

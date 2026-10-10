@@ -75,7 +75,7 @@ const (
 )
 
 // pluginVersion is set from the release tag with -ldflags "-X main.pluginVersion=...".
-var pluginVersion = "0.4.1"
+var pluginVersion = "0.5.0"
 
 var store = &usageStore{}
 

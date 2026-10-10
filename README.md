@@ -7,7 +7,10 @@ plugin and restyled on the management panel's own design system.
 - **Overview:** requests, estimated cost, success and failure, input, cached and output tokens; a live provider
   topology; recent requests; a token/request/cost chart; by-provider and top-model charts; and the usage
   ledger grouped by model, account, API key or endpoint (costs or tokens, sortable, expandable).
-- **Details:** request history with provider and date filters, pagination and a request sheet.
+- **Details:** request history with provider, API key and date filters, pagination and a request sheet. Later
+  pages stay on the history as it was when page 1 loaded, so new requests do not shift them.
+- Under steady traffic the overview refreshes after each refresh finishes, resting 4x as long as it took, so
+  long periods on a big history do not keep the proxy scanning.
 - **Logs:** the last 200 requests, auto-refreshing.
 - Periods: Today, 24h, 7D, 30D, 60D, All, bucketed in the viewer's time zone.
 - Follows the panel's theme (light, dark, white) and reuses the panel's login.
@@ -82,7 +85,7 @@ All routes need the management key; `tz` (minutes east of UTC) sets the time zon
 | `GET /v0/management/usage/stats?period=` | Usage rows, topology providers, live panel |
 | `GET /v0/management/usage/chart?period=` | Hourly (today, 24h) or daily buckets |
 | `GET /v0/management/usage/live` | Recent requests, active providers, last failing provider |
-| `GET /v0/management/usage/details?page&pageSize&provider&from&to` | Request history, newest first |
+| `GET /v0/management/usage/details?page&pageSize&provider&apiKey&from&to&snapshot` | Request history, newest first; `apiKey` is a masked key, `snapshot` the first page's `pagination.snapshot` |
 
 ## Release
 

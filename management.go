@@ -49,7 +49,7 @@ func managementRegistration() map[string]any {
 			{Method: http.MethodGet, Path: apiBase + "/stats", Description: "Usage rows and live panel for ?period=today|24h|7d|30d|60d|all (tz = viewer offset in minutes east of UTC)."},
 			{Method: http.MethodGet, Path: apiBase + "/chart", Description: "Token, request and cost buckets for ?period (hourly for today/24h, daily otherwise)."},
 			{Method: http.MethodGet, Path: apiBase + "/live", Description: "Recent requests, providers that just served a request, and the last failing provider."},
-			{Method: http.MethodGet, Path: apiBase + "/details", Description: "Request history, newest first (?page, pageSize<=200, provider, from, to as RFC 3339)."},
+			{Method: http.MethodGet, Path: apiBase + "/details", Description: "Request history, newest first (?page, pageSize<=200, provider, apiKey as masked, from, to as RFC 3339, snapshot from the first page's pagination so later pages stay put)."},
 		},
 		"resources": resources,
 	}
@@ -94,11 +94,12 @@ func handleManagement(req pluginapi.ManagementRequest, now time.Time) pluginapi.
 	case apiBase + "/live":
 		return jsonResponse(http.StatusOK, store.live(now))
 	case apiBase + "/details":
-		dq, errQuery := parseDetailsQuery(q.Get("page"), q.Get("pageSize"), q.Get("from"), q.Get("to"))
+		dq, errQuery := parseDetailsQuery(q.Get("page"), q.Get("pageSize"), q.Get("snapshot"), q.Get("from"), q.Get("to"))
 		if errQuery != "" {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": errQuery})
 		}
 		dq.provider = strings.TrimSpace(q.Get("provider"))
+		dq.apiKey = strings.TrimSpace(q.Get("apiKey"))
 		return queryResponse(store.details(dq))
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "unknown route"})
@@ -113,7 +114,7 @@ func queryResponse(v any, errQuery error) pluginapi.ManagementResponse {
 	return jsonResponse(http.StatusOK, v)
 }
 
-func parseDetailsQuery(page, pageSize, from, to string) (detailsQuery, string) {
+func parseDetailsQuery(page, pageSize, snapshot, from, to string) (detailsQuery, string) {
 	dq := detailsQuery{page: 1, pageSize: 20}
 	if page != "" {
 		n, errAtoi := strconv.Atoi(page)
@@ -128,6 +129,13 @@ func parseDetailsQuery(page, pageSize, from, to string) (detailsQuery, string) {
 			return dq, "pageSize must be between 1 and 200"
 		}
 		dq.pageSize = n
+	}
+	if snapshot != "" {
+		n, errAtoi := strconv.Atoi(snapshot)
+		if errAtoi != nil || n < 1 {
+			return dq, "snapshot must be >= 1"
+		}
+		dq.snapshot = n
 	}
 	for _, bound := range []struct {
 		raw string
