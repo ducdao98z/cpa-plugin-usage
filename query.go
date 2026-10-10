@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"math"
 	"sort"
 	"strconv"
@@ -24,8 +25,6 @@ type statsRow struct {
 	Cost             float64 `json:"cost"`
 	LastUsed         int64   `json:"lastUsed"`
 }
-
-type rowKey struct{ model, provider, account, apiKey, endpoint string }
 
 type activeRequest struct {
 	Provider string `json:"provider"`
@@ -90,45 +89,39 @@ func startOfDay(t time.Time) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
 }
 
-func (s *usageStore) stats(period string, now time.Time, authProviders []string) map[string]any {
-	from, _ := periodStart(period, now)
-	s.mu.Lock()
-	rows := make(map[rowKey]*statsRow)
-	for i := range s.records {
-		r := &s.records[i]
-		if r.TS < from {
-			continue
-		}
-		key := rowKey{r.Model, r.Provider, r.Account, r.APIKey, r.Endpoint}
-		row := rows[key]
-		if row == nil {
-			row = &statsRow{Model: r.Model, Provider: r.Provider, Account: r.Account, APIKey: r.APIKey, Endpoint: r.Endpoint}
-			rows[key] = row
-		}
-		row.Requests++
-		if r.Failed {
-			row.Failures++
-		}
-		row.PromptTokens += r.Input
-		row.CompletionTokens += r.Output
-		row.CachedTokens += r.Cached
-		row.Cost += r.Cost
-		row.LastUsed = max(row.LastUsed, r.TS)
+func (s *usageStore) stats(period string, now time.Time, authProviders []string) (map[string]any, error) {
+	db, errDB := s.reader()
+	if errDB != nil {
+		return nil, errDB
 	}
-	live := s.liveLocked(now)
-	s.mu.Unlock()
-
-	out := make([]*statsRow, 0, len(rows))
+	from, _ := periodStart(period, now)
+	rows, errQuery := db.Query(`SELECT model, provider, account, api_key, endpoint, COUNT(*), SUM(failed),
+		SUM(input), SUM(output), SUM(cached), TOTAL(cost), MAX(ts)
+		FROM requests WHERE ts >= ? GROUP BY model, provider, account, api_key, endpoint`, from)
+	if errQuery != nil {
+		return nil, errQuery
+	}
+	defer func() { _ = rows.Close() }()
+	out := []*statsRow{}
 	providers := make(map[string]bool)
 	for _, p := range authProviders {
 		providers[strings.ToLower(p)] = true
 	}
-	for _, row := range rows {
+	for rows.Next() {
+		row := &statsRow{}
+		if errScan := rows.Scan(&row.Model, &row.Provider, &row.Account, &row.APIKey, &row.Endpoint, &row.Requests, &row.Failures,
+			&row.PromptTokens, &row.CompletionTokens, &row.CachedTokens, &row.Cost, &row.LastUsed); errScan != nil {
+			return nil, errScan
+		}
 		out = append(out, row)
 		if row.Provider != "" {
 			providers[strings.ToLower(row.Provider)] = true
 		}
 	}
+	if errRows := rows.Err(); errRows != nil {
+		return nil, errRows
+	}
+	live := s.live(now)
 	return map[string]any{
 		"rows":           out,
 		"providers":      sortedKeys(providers),
@@ -136,7 +129,7 @@ func (s *usageStore) stats(period string, now time.Time, authProviders []string)
 		"recentRequests": live.RecentRequests,
 		"errorProvider":  live.ErrorProvider,
 		"total":          live.Total,
-	}
+	}, nil
 }
 
 func (s *usageStore) live(now time.Time) liveView {
@@ -150,10 +143,10 @@ func (s *usageStore) live(now time.Time) liveView {
 // within liveWindow; true in-flight tracking needs a request interceptor on the hot path.
 func (s *usageStore) liveLocked(now time.Time) liveView {
 	nowMs := now.UnixMilli()
-	tail := append([]record(nil), s.records[max(0, len(s.records)-100):]...)
+	tail := append([]record(nil), s.tail[max(0, len(s.tail)-tailSize):]...)
 	sort.SliceStable(tail, func(i, j int) bool { return tail[i].TS > tail[j].TS })
 
-	view := liveView{ActiveRequests: []activeRequest{}, RecentRequests: []recentRequest{}, Total: len(s.records)}
+	view := liveView{ActiveRequests: []activeRequest{}, RecentRequests: []recentRequest{}, Total: s.total}
 	active := make(map[[3]string]int)
 	seen := make(map[string]bool)
 	for _, r := range tail {
@@ -190,7 +183,11 @@ func (s *usageStore) liveLocked(now time.Time) liveView {
 }
 
 // chart buckets a period by hour (today, 24h) or by day, in the viewer's time zone.
-func (s *usageStore) chart(period string, now time.Time) []chartPoint {
+func (s *usageStore) chart(period string, now time.Time) ([]chartPoint, error) {
+	db, errDB := s.reader()
+	if errDB != nil {
+		return nil, errDB
+	}
 	day := startOfDay(now)
 	var starts []time.Time
 	end := day.AddDate(0, 0, 1)
@@ -211,68 +208,72 @@ func (s *usageStore) chart(period string, now time.Time) []chartPoint {
 			starts = append(starts, day.AddDate(0, 0, -i))
 		}
 	case "all":
-		s.mu.Lock()
-		earliest := int64(math.MaxInt64)
-		for i := range s.records {
-			earliest = min(earliest, s.records[i].TS)
+		var earliest sql.NullInt64
+		if errMin := db.QueryRow("SELECT MIN(ts) FROM requests").Scan(&earliest); errMin != nil {
+			return nil, errMin
 		}
-		s.mu.Unlock()
-		if earliest == math.MaxInt64 {
-			return []chartPoint{}
+		if !earliest.Valid {
+			return []chartPoint{}, nil
 		}
-		for d := startOfDay(time.UnixMilli(earliest).In(now.Location())); d.Before(end); d = d.AddDate(0, 0, 1) {
+		for d := startOfDay(time.UnixMilli(earliest.Int64).In(now.Location())); d.Before(end); d = d.AddDate(0, 0, 1) {
 			starts = append(starts, d)
 		}
 	}
 
 	points := make([]chartPoint, len(starts))
-	bounds := make([]int64, len(starts))
+	if len(points) == 0 {
+		return points, nil
+	}
+	bucket, errPrepare := db.Prepare("SELECT COUNT(*), IFNULL(SUM(input + output), 0), TOTAL(cost) FROM requests WHERE ts >= ? AND ts < ?")
+	if errPrepare != nil {
+		return nil, errPrepare
+	}
+	defer func() { _ = bucket.Close() }()
 	for i, start := range starts {
-		points[i].TS = start.UnixMilli()
-		bounds[i] = points[i].TS
-	}
-	if len(bounds) == 0 {
-		return points
-	}
-	first, last := bounds[0], end.UnixMilli()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.records {
-		r := &s.records[i]
-		if r.TS < first || r.TS >= last {
-			continue
+		next := end
+		if i+1 < len(starts) {
+			next = starts[i+1]
 		}
-		idx := sort.Search(len(bounds), func(j int) bool { return bounds[j] > r.TS }) - 1
-		points[idx].Tokens += r.Input + r.Output
-		points[idx].Cost += r.Cost
-		points[idx].Requests++
+		points[i].TS = start.UnixMilli()
+		if errScan := bucket.QueryRow(points[i].TS, next.UnixMilli()).Scan(&points[i].Requests, &points[i].Tokens, &points[i].Cost); errScan != nil {
+			return nil, errScan
+		}
 	}
-	return points
+	return points, nil
 }
 
 // details pages through matching records, newest request first.
-func (s *usageStore) details(q detailsQuery) map[string]any {
+func (s *usageStore) details(q detailsQuery) (map[string]any, error) {
+	db, errDB := s.reader()
+	if errDB != nil {
+		return nil, errDB
+	}
+	var conds []string
+	var args []any
+	if q.provider != "" {
+		conds, args = append(conds, "provider = ?"), append(args, q.provider)
+	}
+	if q.from != 0 {
+		conds, args = append(conds, "ts >= ?"), append(args, q.from)
+	}
+	if q.to != 0 {
+		conds, args = append(conds, "ts <= ?"), append(args, q.to)
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+	var total int
+	if errCount := db.QueryRow("SELECT COUNT(*) FROM requests"+where, args...).Scan(&total); errCount != nil {
+		return nil, errCount
+	}
+	items, errItems := scanRecords(db.Query("SELECT "+recordColumns+" FROM requests"+where+" ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?",
+		append(args, q.pageSize, (q.page-1)*q.pageSize)...))
+	if errItems != nil {
+		return nil, errItems
+	}
 	s.mu.Lock()
-	providers := make(map[string]bool)
-	matched := make([]int, 0, 64)
-	for i := range s.records {
-		r := &s.records[i]
-		if r.Provider != "" {
-			providers[r.Provider] = true
-		}
-		if (q.provider != "" && r.Provider != q.provider) || (q.from != 0 && r.TS < q.from) || (q.to != 0 && r.TS > q.to) {
-			continue
-		}
-		matched = append(matched, i)
-	}
-	sort.SliceStable(matched, func(a, b int) bool { return s.records[matched[a]].TS > s.records[matched[b]].TS })
-	total := len(matched)
-	lo := min(total, (q.page-1)*q.pageSize)
-	hi := min(total, lo+q.pageSize)
-	items := make([]record, 0, hi-lo)
-	for _, i := range matched[lo:hi] {
-		items = append(items, s.records[i])
-	}
+	providers := sortedKeys(s.providers)
 	s.mu.Unlock()
 
 	return map[string]any{
@@ -281,8 +282,8 @@ func (s *usageStore) details(q detailsQuery) map[string]any {
 			"page": q.page, "pageSize": q.pageSize, "totalItems": total,
 			"totalPages": (total + q.pageSize - 1) / q.pageSize,
 		},
-		"providers": sortedKeys(providers),
-	}
+		"providers": providers,
+	}, nil
 }
 
 func sortedKeys(set map[string]bool) []string {

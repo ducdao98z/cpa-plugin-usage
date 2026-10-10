@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -11,24 +12,28 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	_ "modernc.org/sqlite" // pure Go: every platform builds without a C SQLite
 )
 
 const (
-	patchWindow   = 512              // records searched when a request path arrives after its usage
+	patchWindow   = 512              // newest records searched when a request path arrives after its usage
+	tailSize      = 100              // newest records kept in memory for the live panel
 	liveWindow    = 5 * time.Second  // a provider counts as active this long after a request finished
 	errorWindow   = 10 * time.Second // how long the last failing provider stays highlighted (as in 9router)
 	authCacheTTL  = 30 * time.Second
 	maxErrorChars = 500
 )
 
-// record is one finished model execution, stored as one JSON object per line.
-// A line without ts is an endpoint patch: {"trace","endpoint"} for records written earlier.
+// record is one finished model execution: a row of the requests table. Versions before 0.4.0 kept
+// one JSON object per line instead, where a line without ts patches the endpoint ({"trace","endpoint"})
+// of records written earlier.
 type record struct {
 	ID         string  `json:"id,omitempty"`
 	Trace      string  `json:"trace,omitempty"`
@@ -52,19 +57,61 @@ type record struct {
 	Stream     bool    `json:"stream,omitempty"`
 	Cost       float64 `json:"cost,omitempty"`
 
-	arrived int64 // unix ms the plugin received it; drives the live view and is not persisted
+	arrived int64 // unix ms the plugin received it; drives the live view and is not stored
 }
+
+// recordColumns names the requests columns in the order of record.fields.
+const recordColumns = "id, trace, ts, provider, model, alias, account, api_key, endpoint, input, output, cached, " +
+	"cache_write, reasoning, latency_ms, ttft_ms, status, failed, error, stream, cost"
+
+// fields points at a record's values in recordColumns order, for scanning and inserting alike.
+func (r *record) fields() []any {
+	return []any{&r.ID, &r.Trace, &r.TS, &r.Provider, &r.Model, &r.Alias, &r.Account, &r.APIKey, &r.Endpoint, &r.Input,
+		&r.Output, &r.Cached, &r.CacheWrite, &r.Reasoning, &r.LatencyMs, &r.TTFTMs, &r.Status, &r.Failed, &r.Error, &r.Stream, &r.Cost}
+}
+
+const schema = `
+CREATE TABLE IF NOT EXISTS requests (
+	id          TEXT    NOT NULL DEFAULT '',
+	trace       TEXT    NOT NULL DEFAULT '',
+	ts          INTEGER NOT NULL,
+	provider    TEXT    NOT NULL DEFAULT '',
+	model       TEXT    NOT NULL DEFAULT '',
+	alias       TEXT    NOT NULL DEFAULT '',
+	account     TEXT    NOT NULL DEFAULT '',
+	api_key     TEXT    NOT NULL DEFAULT '',
+	endpoint    TEXT    NOT NULL DEFAULT '',
+	input       INTEGER NOT NULL DEFAULT 0,
+	output      INTEGER NOT NULL DEFAULT 0,
+	cached      INTEGER NOT NULL DEFAULT 0,
+	cache_write INTEGER NOT NULL DEFAULT 0,
+	reasoning   INTEGER NOT NULL DEFAULT 0,
+	latency_ms  INTEGER NOT NULL DEFAULT 0,
+	ttft_ms     INTEGER NOT NULL DEFAULT 0,
+	status      INTEGER NOT NULL DEFAULT 0,
+	failed      INTEGER NOT NULL DEFAULT 0,
+	error       TEXT    NOT NULL DEFAULT '',
+	stream      INTEGER NOT NULL DEFAULT 0,
+	cost        REAL    NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS requests_ts ON requests (ts);`
+
+var insertRecord = "INSERT INTO requests (" + recordColumns + ") VALUES (?" + strings.Repeat(", ?", strings.Count(recordColumns, ",")) + ")"
+
+var errNotOpen = errors.New("usage history is not open")
 
 type pathNote struct{ trace, path string }
 
-// usageStore keeps every record in memory and appends it to the data file.
-// ponytail: whole history in memory (~200 B per request) and full scans per query;
-// fine to a few million requests, add daily rollups + raw retention past that.
+// usageStore keeps the history in a SQLite database and only the newest records in memory.
+// ponytail: stats and charts scan every row of their period (~1.7 s per million rows for "all");
+// add hourly rollups when long periods get slow.
 type usageStore struct {
-	mu          sync.Mutex
+	mu          sync.Mutex // orders writes and guards the fields below
 	path        string
-	file        *os.File
-	records     []record
+	db          *sql.DB
+	tail        []record              // newest records, oldest first
+	total       int                   // records stored
+	providers   map[string]bool       // every provider stored, for the Details filter
 	paths       [patchWindow]pathNote // recent trace -> request path, for usage that arrives after it
 	pathPos     int
 	errProvider string
@@ -75,48 +122,154 @@ type usageStore struct {
 	authsAt time.Time
 }
 
-// open loads the history at path and appends new records to it.
+// open keeps the history in the SQLite database at path. A .jsonl path (configs before 0.4.0) stands for
+// the .db next to it, and a JSON lines history next to the database is imported into it once.
 func (s *usageStore) open(path string) error {
+	legacy := strings.TrimSuffix(path, filepath.Ext(path)) + ".jsonl"
+	if path == legacy {
+		path = strings.TrimSuffix(path, ".jsonl") + ".db"
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.path == path && s.file != nil {
+	if s.path == path && s.db != nil {
 		return nil
 	}
-	if s.file != nil {
-		_ = s.file.Close()
-		s.file = nil
-	}
+	s.closeLocked()
 	s.path = path
-	records, errRead := readRecords(path)
-	if errRead != nil && !errors.Is(errRead, os.ErrNotExist) {
-		return fmt.Errorf("read %s: %w", path, errRead)
-	}
-	s.records = records
-	if errMkdir := os.MkdirAll(filepath.Dir(path), 0o755); errMkdir != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(path), errMkdir)
-	}
-	file, errOpen := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	db, errOpen := openDB(path)
 	if errOpen != nil {
-		return fmt.Errorf("open %s: %w", path, errOpen)
+		errOpen = fmt.Errorf("open %s: %w", path, errOpen)
+		// Keep counting in memory; the page still works until the file becomes usable.
+		var errMemory error
+		if db, errMemory = openDB(":memory:"); errMemory != nil {
+			return errors.Join(errOpen, errMemory)
+		}
+	} else if errImport := importJSONL(db, legacy); errImport != nil {
+		hostLog("warn", "usage: import "+legacy+": "+errImport.Error())
 	}
-	// A crash can leave a torn last line; start on a fresh line so the next record stays readable.
-	if info, errStat := file.Stat(); errStat == nil && info.Size() > 0 {
-		last := make([]byte, 1)
-		if _, errLast := file.ReadAt(last, info.Size()-1); errLast == nil && last[0] != '\n' {
-			_, _ = file.Write([]byte{'\n'})
+	s.db = db
+	return errors.Join(errOpen, s.loadLocked())
+}
+
+func openDB(path string) (*sql.DB, error) {
+	if path != ":memory:" {
+		if errMkdir := os.MkdirAll(filepath.Dir(path), 0o755); errMkdir != nil {
+			return nil, errMkdir
 		}
 	}
-	s.file = file
+	// WAL lets the page read while requests are written; NORMAL skips an fsync per request.
+	db, errOpen := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
+	if errOpen != nil {
+		return nil, errOpen
+	}
+	if path == ":memory:" {
+		db.SetMaxOpenConns(1) // every connection would get its own empty database
+	}
+	if _, errSchema := db.Exec(schema); errSchema != nil {
+		_ = db.Close()
+		return nil, errSchema
+	}
+	return db, nil
+}
+
+// loadLocked reads what stays in memory: the record count, the providers and the newest records.
+func (s *usageStore) loadLocked() error {
+	s.total, s.providers, s.tail = 0, map[string]bool{}, nil
+	if errCount := s.db.QueryRow("SELECT COUNT(*) FROM requests").Scan(&s.total); errCount != nil {
+		return errCount
+	}
+	rows, errQuery := s.db.Query("SELECT DISTINCT provider FROM requests WHERE provider != ''")
+	if errQuery != nil {
+		return errQuery
+	}
+	for rows.Next() {
+		var provider string
+		if rows.Scan(&provider) == nil {
+			s.providers[provider] = true
+		}
+	}
+	errRows := rows.Err()
+	_ = rows.Close()
+	tail, errTail := scanRecords(s.db.Query("SELECT "+recordColumns+" FROM requests ORDER BY rowid DESC LIMIT ?", tailSize))
+	slices.Reverse(tail)
+	s.tail = tail
+	return errors.Join(errRows, errTail)
+}
+
+// importJSONL moves the JSON lines history of versions before 0.4.0 into the database. The file is
+// renamed before the import commits, so it is never imported twice and stays as a backup.
+func importJSONL(db *sql.DB, path string) error {
+	records, errRead := readRecords(path)
+	if errors.Is(errRead, os.ErrNotExist) {
+		return nil
+	}
+	if errRead != nil {
+		return errRead
+	}
+	tx, errBegin := db.Begin()
+	if errBegin != nil {
+		return errBegin
+	}
+	defer func() { _ = tx.Rollback() }()
+	insert, errPrepare := tx.Prepare(insertRecord)
+	if errPrepare != nil {
+		return errPrepare
+	}
+	for i := range records {
+		if _, errInsert := insert.Exec(records[i].fields()...); errInsert != nil {
+			return errInsert
+		}
+	}
+	done := path + ".imported"
+	if errRename := os.Rename(path, done); errRename != nil {
+		return errRename
+	}
+	if errCommit := tx.Commit(); errCommit != nil {
+		_ = os.Rename(done, path) // import it again next start
+		return errCommit
+	}
+	hostLog("info", fmt.Sprintf("usage: imported %d records from %s (kept as %s)", len(records), path, done))
 	return nil
 }
 
 func (s *usageStore) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.file != nil {
-		_ = s.file.Close()
-		s.file = nil
+	s.closeLocked()
+}
+
+func (s *usageStore) closeLocked() {
+	if s.db != nil {
+		_ = s.db.Close()
+		s.db = nil
 	}
+}
+
+// reader returns the database for queries, which need no lock: WAL lets them run beside writes.
+func (s *usageStore) reader() (*sql.DB, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return nil, errNotOpen
+	}
+	return s.db, nil
+}
+
+// scanRecords reads every row of a query over recordColumns.
+func scanRecords(rows *sql.Rows, errQuery error) ([]record, error) {
+	if errQuery != nil {
+		return nil, errQuery
+	}
+	defer func() { _ = rows.Close() }()
+	out := []record{}
+	for rows.Next() {
+		var r record
+		if errScan := rows.Scan(r.fields()...); errScan != nil {
+			return nil, errScan
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func readRecords(path string) ([]record, error) {
@@ -149,27 +302,11 @@ func readRecords(path string) ([]record, error) {
 }
 
 // patchEndpoint fills the endpoint of recent records from the same inbound request.
-func patchEndpoint(records []record, trace, path string) bool {
-	patched := false
+func patchEndpoint(records []record, trace, path string) {
 	for i := len(records) - 1; i >= 0 && i >= len(records)-patchWindow; i-- {
 		if records[i].Trace == trace && records[i].Endpoint == "" {
 			records[i].Endpoint = path
-			patched = true
 		}
-	}
-	return patched
-}
-
-func (s *usageStore) writeLine(v any) {
-	if s.file == nil {
-		return
-	}
-	raw, errMarshal := json.Marshal(v)
-	if errMarshal != nil {
-		return
-	}
-	if _, errWrite := s.file.Write(append(raw, '\n')); errWrite != nil {
-		hostLog("warn", "usage: write "+s.path+": "+errWrite.Error())
 	}
 }
 
@@ -188,11 +325,24 @@ func (s *usageStore) addUsage(u pluginapi.UsageRecord, account string, now time.
 			}
 		}
 	}
-	s.records = append(s.records, rec)
+	if s.db == nil {
+		return
+	}
+	if _, errInsert := s.db.Exec(insertRecord, rec.fields()...); errInsert != nil {
+		hostLog("warn", "usage: save request: "+errInsert.Error())
+		return
+	}
+	s.total++
+	s.tail = append(s.tail, rec)
+	if len(s.tail) > 2*tailSize {
+		s.tail = slices.Clone(s.tail[len(s.tail)-tailSize:]) // trim now and then, not on every request
+	}
+	if rec.Provider != "" {
+		s.providers[rec.Provider] = true
+	}
 	if rec.Failed && rec.Provider != "" {
 		s.errProvider, s.errAt = strings.ToLower(rec.Provider), rec.arrived
 	}
-	s.writeLine(rec)
 }
 
 // addEndpoint records the request path reported when an inbound request completes.
@@ -205,8 +355,12 @@ func (s *usageStore) addEndpoint(trace, path string) {
 	defer s.mu.Unlock()
 	s.paths[s.pathPos%patchWindow] = pathNote{trace: trace, path: path}
 	s.pathPos++
-	if patchEndpoint(s.records, trace, path) {
-		s.writeLine(record{Trace: trace, Endpoint: path})
+	if s.db == nil {
+		return
+	}
+	const patch = "UPDATE requests SET endpoint = ? WHERE trace = ? AND endpoint = '' AND rowid > (SELECT IFNULL(MAX(rowid), 0) FROM requests) - ?"
+	if _, errUpdate := s.db.Exec(patch, path, trace, patchWindow); errUpdate != nil {
+		hostLog("warn", "usage: save request path: "+errUpdate.Error())
 	}
 }
 

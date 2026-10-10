@@ -88,9 +88,9 @@ func handleManagement(req pluginapi.ManagementRequest, now time.Time) pluginapi.
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid period"})
 		}
 		if reqPath == apiBase+"/chart" {
-			return jsonResponse(http.StatusOK, store.chart(period, now))
+			return queryResponse(store.chart(period, now))
 		}
-		return jsonResponse(http.StatusOK, store.stats(period, now, authProviders(now)))
+		return queryResponse(store.stats(period, now, authProviders(now)))
 	case apiBase + "/live":
 		return jsonResponse(http.StatusOK, store.live(now))
 	case apiBase + "/details":
@@ -99,9 +99,18 @@ func handleManagement(req pluginapi.ManagementRequest, now time.Time) pluginapi.
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": errQuery})
 		}
 		dq.provider = strings.TrimSpace(q.Get("provider"))
-		return jsonResponse(http.StatusOK, store.details(dq))
+		return queryResponse(store.details(dq))
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "unknown route"})
+}
+
+// queryResponse answers with a query result, or a 500 when the history could not be read.
+func queryResponse(v any, errQuery error) pluginapi.ManagementResponse {
+	if errQuery != nil {
+		hostLog("warn", "usage: query: "+errQuery.Error())
+		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "read usage history: " + errQuery.Error()})
+	}
+	return jsonResponse(http.StatusOK, v)
 }
 
 func parseDetailsQuery(page, pageSize, from, to string) (detailsQuery, string) {

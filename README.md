@@ -43,8 +43,12 @@ plugins:
   configs:
     usage:
       enabled: true
-      data-file: "plugins/usage.jsonl" # optional, this is the default (relative to the working directory)
+      data-file: "plugins/usage.db" # optional, this is the default (relative to the working directory)
 ```
+
+Versions before 0.4.0 kept the history in `plugins/usage.jsonl`. On first start, 0.4.0 imports that file into
+the database once and keeps it as `usage.jsonl.imported`; a `data-file` that still names the `.jsonl` file
+means the `.db` next to it.
 
 ## Open
 
@@ -55,7 +59,10 @@ key once and keeps it in this browser until **Forget key**.
 ## How it works
 
 - `usage.handle` gives one record per finished model call; `request.complete` adds the request path
-  (endpoint). Records are appended to `data-file`, one JSON object per line, and replayed on start.
+  (endpoint). Every request is a row of the `requests` table in `data-file`, a SQLite database (WAL mode,
+  pure-Go driver, so no C SQLite is needed). Only the newest 100 requests stay in memory, for the live panel;
+  the history is kept until you delete it, and you can query it yourself, e.g.
+  `sqlite3 plugins/usage.db "SELECT model, COUNT(*) FROM requests GROUP BY model"`.
 - Raw client and upstream API keys are never stored, only masked (`sk-abcde***wxyz`).
 - Cost is an estimate from 9router's price table (`pricing.json`, USD per 1M tokens), not billing.
 - API key names: the panel lets you name client API keys (Config → Client API Keys → Edit) and keeps the

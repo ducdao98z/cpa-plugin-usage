@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -64,7 +65,7 @@ func TestAccountLabel(t *testing.T) {
 }
 
 func TestStoreRoundTripAndQueries(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	path := filepath.Join(t.TempDir(), "usage.db")
 	s := &usageStore{}
 	if errOpen := s.open(path); errOpen != nil {
 		t.Fatal(errOpen)
@@ -85,10 +86,6 @@ func TestStoreRoundTripAndQueries(t *testing.T) {
 	s.addEndpoint("t2", "/v1/messages")
 	s.close()
 
-	// Simulate a crash mid-write, then reload.
-	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
-	_, _ = f.WriteString(`{"id":"torn","ts":12`)
-	_ = f.Close()
 	reloaded := &usageStore{}
 	if errOpen := reloaded.open(path); errOpen != nil {
 		t.Fatal(errOpen)
@@ -96,20 +93,32 @@ func TestStoreRoundTripAndQueries(t *testing.T) {
 	reloaded.addUsage(pluginapi.UsageRecord{TraceID: "t5", Provider: "codex", Model: "gpt-5", RequestedAt: now, Generate: true}, "", now)
 	reloaded.close()
 	s = &usageStore{}
-	_ = s.open(path)
-	if len(s.records) != 4 {
-		t.Fatalf("records after reload = %d, want 4", len(s.records))
+	if errOpen := s.open(path); errOpen != nil {
+		t.Fatal(errOpen)
 	}
-	if s.records[0].Endpoint != "/v1/chat/completions" || s.records[1].Endpoint != "/v1/messages" || s.records[2].Endpoint != "" {
-		t.Fatalf("endpoints = %q %q %q", s.records[0].Endpoint, s.records[1].Endpoint, s.records[2].Endpoint)
+	defer s.close()
+
+	all := must(s.details(detailsQuery{page: 1, pageSize: 10}))
+	items := all["details"].([]record) // newest first: t5, t1, t2, t3
+	if len(items) != 4 || items[0].Trace != "t5" || items[3].Trace != "t3" {
+		t.Fatalf("records after reload = %+v", items)
 	}
-	if s.records[0].APIKey != "sk-12345***cdef" || !s.records[1].Failed {
-		t.Fatalf("record = %+v", s.records[1])
+	if items[1].Endpoint != "/v1/chat/completions" || items[2].Endpoint != "/v1/messages" || items[3].Endpoint != "" {
+		t.Fatalf("endpoints = %q %q %q", items[1].Endpoint, items[2].Endpoint, items[3].Endpoint)
+	}
+	if items[1].APIKey != "sk-12345***cdef" || items[1].Input != 10 || items[1].Output != 5 || !items[2].Failed {
+		t.Fatalf("records = %+v", items)
+	}
+	if providers := all["providers"].([]string); len(providers) != 2 || providers[0] != "codex" || providers[1] != "xai" {
+		t.Fatalf("providers = %v", providers)
+	}
+	if live := s.live(now); live.Total != 4 || len(live.RecentRequests) != 3 || len(live.ActiveRequests) != 0 {
+		t.Fatalf("live after reload = %+v", live)
 	}
 
 	for period, want := range map[string][2]int64{"today": {2, 0}, "7d": {3, 1}, "all": {4, 1}} {
 		var requests, failures int64
-		for _, row := range s.stats(period, now, nil)["rows"].([]*statsRow) {
+		for _, row := range must(s.stats(period, now, nil))["rows"].([]*statsRow) {
 			requests += row.Requests
 			failures += row.Failures
 		}
@@ -117,16 +126,80 @@ func TestStoreRoundTripAndQueries(t *testing.T) {
 			t.Errorf("%s requests/failures = %d/%d, want %d/%d", period, requests, failures, want[0], want[1])
 		}
 	}
-	week := s.chart("7d", now)
-	if len(week) != 7 || week[6].Requests != 2 || week[3].Requests != 1 || week[6].TS != startOfDay(now).UnixMilli() {
+	week := must(s.chart("7d", now))
+	if len(week) != 7 || week[6].Requests != 2 || week[3].Requests != 1 || week[6].TS != startOfDay(now).UnixMilli() || week[6].Tokens != 15 {
 		t.Fatalf("7d chart = %+v", week)
 	}
-	if hours := s.chart("today", now); len(hours) != 24 || hours[11].Requests != 1 || hours[12].Requests != 1 {
+	if hours := must(s.chart("today", now)); len(hours) != 24 || hours[11].Requests != 1 || hours[12].Requests != 1 {
 		t.Fatalf("today chart = %+v", hours)
 	}
-	page := s.details(detailsQuery{page: 1, pageSize: 2, provider: "codex"})
-	items := page["details"].([]record)
+	var sum int64
+	days := must(s.chart("all", now))
+	for _, p := range days {
+		sum += p.Requests
+	}
+	if len(days) != 41 || sum != 4 {
+		t.Fatalf("all chart: %d days, %d requests", len(days), sum)
+	}
+	page := must(s.details(detailsQuery{page: 1, pageSize: 2, provider: "codex"}))
+	items = page["details"].([]record)
 	if len(items) != 2 || items[0].Trace != "t5" || page["pagination"].(map[string]int)["totalItems"] != 3 {
 		t.Fatalf("details = %+v", page)
 	}
+	page = must(s.details(detailsQuery{page: 1, pageSize: 10, from: now.AddDate(0, 0, -7).UnixMilli(), to: now.Add(-time.Minute).UnixMilli()}))
+	if items = page["details"].([]record); len(items) != 2 || items[0].Trace != "t1" || items[1].Trace != "t2" {
+		t.Fatalf("details from/to = %+v", items)
+	}
+}
+
+func TestImportJSONL(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "usage.jsonl")
+	history := `{"id":"a","trace":"t1","ts":1000,"provider":"codex","model":"gpt-5","input":10,"output":5}
+{"trace":"t1","endpoint":"/v1/responses"}
+{"id":"b","trace":"t2","ts":2000,"provider":"xai","model":"grok-4","failed":true,"status":500}
+{"id":"torn","ts":12`
+	if errWrite := os.WriteFile(legacy, []byte(history), 0o644); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	s := &usageStore{}
+	if errOpen := s.open(legacy); errOpen != nil { // configs before 0.4.0 name the .jsonl file
+		t.Fatal(errOpen)
+	}
+	s.close()
+	if _, errStat := os.Stat(legacy + ".imported"); errStat != nil {
+		t.Fatalf("history not kept as a backup: %v", errStat)
+	}
+	if _, errStat := os.Stat(legacy); !errors.Is(errStat, os.ErrNotExist) {
+		t.Fatal("history left in place, so it would be imported again")
+	}
+	s = &usageStore{}
+	if errOpen := s.open(filepath.Join(dir, "usage.db")); errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	defer s.close()
+	items := must(s.details(detailsQuery{page: 1, pageSize: 10}))["details"].([]record)
+	if len(items) != 2 || items[0].ID != "b" || !items[0].Failed || items[0].Status != 500 || items[1].Endpoint != "/v1/responses" || items[1].Input != 10 {
+		t.Fatalf("imported = %+v", items)
+	}
+}
+
+func TestOpenKeepsCountingWithoutTheDatabase(t *testing.T) {
+	s := &usageStore{}
+	if errOpen := s.open(t.TempDir()); errOpen == nil { // a directory, not a database
+		t.Fatal("open succeeded on a directory")
+	}
+	defer s.close()
+	s.addUsage(pluginapi.UsageRecord{Provider: "codex", Model: "gpt-5", Generate: true}, "", time.Now())
+	if page := must(s.details(detailsQuery{page: 1, pageSize: 10})); page["pagination"].(map[string]int)["totalItems"] != 1 {
+		t.Fatalf("in-memory history = %+v", page)
+	}
+}
+
+// must unwraps a query result.
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }

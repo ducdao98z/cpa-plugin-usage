@@ -71,11 +71,11 @@ const (
 	pluginIdentifier = "usage"
 	displayName      = "Usage Analytics" // plugin name and PLUGINS menu label in the panel
 	repositoryURL    = "https://github.com/ducdao98z/cpa-plugin-usage"
-	defaultDataFile  = "plugins/usage.jsonl"
+	defaultDataFile  = "plugins/usage.db"
 )
 
 // pluginVersion is set from the release tag with -ldflags "-X main.pluginVersion=...".
-var pluginVersion = "0.3.9"
+var pluginVersion = "0.4.0"
 
 var store = &usageStore{}
 
@@ -220,7 +220,7 @@ func pluginRegistration() registration {
 			Author:           "ducdao98z",
 			GitHubRepository: repositoryURL,
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "data-file", Type: pluginapi.ConfigFieldTypeString, Description: "Usage history file (JSON lines). Default: " + defaultDataFile + " (relative to the CLIProxyAPI working directory)."},
+				{Name: "data-file", Type: pluginapi.ConfigFieldTypeString, Description: "Usage history database (SQLite). Default: " + defaultDataFile + " (relative to the CLIProxyAPI working directory); a .jsonl history of the same name (before 0.4.0) is imported once."},
 			},
 		},
 		Capabilities: registrationCapability{
