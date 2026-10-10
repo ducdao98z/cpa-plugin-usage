@@ -46,9 +46,9 @@ plugins:
       data-file: "plugins/usage.db" # optional, this is the default (relative to the working directory)
 ```
 
-Versions before 0.4.0 kept the history in `plugins/usage.jsonl`. On first start, 0.4.0 imports that file into
-the database once and keeps it as `usage.jsonl.imported`; a `data-file` that still names the `.jsonl` file
-means the `.db` next to it.
+Versions before 0.4.0 kept the history in `plugins/usage.jsonl`. On first start, 0.4.0 and later import that
+file into the database, skipping records it already has, and keep it as `usage.jsonl.imported`; a `data-file`
+that still names the `.jsonl` file means the `.db` next to it.
 
 ## Open
 

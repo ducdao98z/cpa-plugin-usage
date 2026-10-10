@@ -75,7 +75,7 @@ const (
 )
 
 // pluginVersion is set from the release tag with -ldflags "-X main.pluginVersion=...".
-var pluginVersion = "0.4.0"
+var pluginVersion = "0.4.1"
 
 var store = &usageStore{}
 
@@ -154,9 +154,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, errConfigure
 		}
 		return okEnvelope(pluginRegistration())
-	case pluginabi.MethodPluginQuiesce:
-		return okEnvelope(struct{}{})
-	case pluginabi.MethodPluginShutdown:
+	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+		// The host quiesces a plugin before loading another copy of it, and two copies of SQLite in one
+		// process must not hold the same file; a register reopens the database.
 		store.close()
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodUsageHandle:

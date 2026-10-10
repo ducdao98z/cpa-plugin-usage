@@ -196,8 +196,9 @@ func (s *usageStore) loadLocked() error {
 	return errors.Join(errRows, errTail)
 }
 
-// importJSONL moves the JSON lines history of versions before 0.4.0 into the database. The file is
-// renamed before the import commits, so it is never imported twice and stays as a backup.
+// importJSONL moves the JSON lines history of versions before 0.4.0 into the database, skipping records
+// it already has (a history put back after a rollback). The file is renamed before the import commits,
+// so it is imported once and stays as a backup.
 func importJSONL(db *sql.DB, path string) error {
 	records, errRead := readRecords(path)
 	if errors.Is(errRead, os.ErrNotExist) {
@@ -211,14 +212,19 @@ func importJSONL(db *sql.DB, path string) error {
 		return errBegin
 	}
 	defer func() { _ = tx.Rollback() }()
-	insert, errPrepare := tx.Prepare(insertRecord)
+	insert, errPrepare := tx.Prepare("INSERT INTO requests (" + recordColumns + ") SELECT ?" + strings.Repeat(", ?", strings.Count(recordColumns, ",")) +
+		" WHERE NOT EXISTS (SELECT 1 FROM requests WHERE ts = ? AND id = ?)")
 	if errPrepare != nil {
 		return errPrepare
 	}
+	imported := int64(0)
 	for i := range records {
-		if _, errInsert := insert.Exec(records[i].fields()...); errInsert != nil {
+		res, errInsert := insert.Exec(append(records[i].fields(), records[i].TS, records[i].ID)...)
+		if errInsert != nil {
 			return errInsert
 		}
+		n, _ := res.RowsAffected()
+		imported += n
 	}
 	done := path + ".imported"
 	if errRename := os.Rename(path, done); errRename != nil {
@@ -228,7 +234,7 @@ func importJSONL(db *sql.DB, path string) error {
 		_ = os.Rename(done, path) // import it again next start
 		return errCommit
 	}
-	hostLog("info", fmt.Sprintf("usage: imported %d records from %s (kept as %s)", len(records), path, done))
+	hostLog("info", fmt.Sprintf("usage: imported %d of %d records from %s (kept as %s)", imported, len(records), path, done))
 	return nil
 }
 

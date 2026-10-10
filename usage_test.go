@@ -173,13 +173,17 @@ func TestImportJSONL(t *testing.T) {
 	if _, errStat := os.Stat(legacy); !errors.Is(errStat, os.ErrNotExist) {
 		t.Fatal("history left in place, so it would be imported again")
 	}
+	// A rollback puts the history back and adds to it; upgrading again imports only the new record.
+	if errWrite := os.WriteFile(legacy, []byte(history+"\n"+`{"id":"c","ts":3000,"provider":"codex","model":"gpt-5"}`+"\n"), 0o644); errWrite != nil {
+		t.Fatal(errWrite)
+	}
 	s = &usageStore{}
 	if errOpen := s.open(filepath.Join(dir, "usage.db")); errOpen != nil {
 		t.Fatal(errOpen)
 	}
 	defer s.close()
 	items := must(s.details(detailsQuery{page: 1, pageSize: 10}))["details"].([]record)
-	if len(items) != 2 || items[0].ID != "b" || !items[0].Failed || items[0].Status != 500 || items[1].Endpoint != "/v1/responses" || items[1].Input != 10 {
+	if len(items) != 3 || items[0].ID != "c" || items[1].ID != "b" || !items[1].Failed || items[1].Status != 500 || items[2].Endpoint != "/v1/responses" || items[2].Input != 10 {
 		t.Fatalf("imported = %+v", items)
 	}
 }
