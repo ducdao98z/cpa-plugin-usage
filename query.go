@@ -43,10 +43,17 @@ type recentRequest struct {
 	Status           string `json:"status"`
 }
 
+// flame is the fire a provider sends into the sun on the topology after it served a request.
+type flame struct {
+	Left   int64 `json:"left"`   // ms the fire keeps flowing
+	Failed bool  `json:"failed"` // the provider's latest request failed
+}
+
 type liveView struct {
-	ActiveRequests []activeRequest `json:"activeRequests"`
-	RecentRequests []recentRequest `json:"recentRequests"`
-	ErrorProvider  string          `json:"errorProvider"`
+	ActiveRequests []activeRequest  `json:"activeRequests"`
+	RecentRequests []recentRequest  `json:"recentRequests"`
+	ErrorProvider  string           `json:"errorProvider"`
+	Flames         map[string]flame `json:"flames"`
 	// Total counts every stored record; the page reloads its stats when it changes.
 	Total int `json:"total"`
 }
@@ -129,6 +136,7 @@ func (s *usageStore) stats(period string, now time.Time, authProviders []string)
 		"activeRequests": live.ActiveRequests,
 		"recentRequests": live.RecentRequests,
 		"errorProvider":  live.ErrorProvider,
+		"flames":         live.Flames,
 		"total":          live.Total,
 	}, nil
 }
@@ -147,7 +155,12 @@ func (s *usageStore) liveLocked(now time.Time) liveView {
 	tail := append([]record(nil), s.tail[max(0, len(s.tail)-tailSize):]...)
 	sort.SliceStable(tail, func(i, j int) bool { return tail[i].TS > tail[j].TS })
 
-	view := liveView{ActiveRequests: []activeRequest{}, RecentRequests: []recentRequest{}, Total: s.total}
+	view := liveView{ActiveRequests: []activeRequest{}, RecentRequests: []recentRequest{}, Flames: map[string]flame{}, Total: s.total}
+	for provider, last := range s.latest {
+		if left := last.arrived + flameWindow.Milliseconds() - nowMs; left > 0 {
+			view.Flames[provider] = flame{Left: left, Failed: last.failed}
+		}
+	}
 	active := make(map[[3]string]int)
 	seen := make(map[string]bool)
 	for _, r := range tail {

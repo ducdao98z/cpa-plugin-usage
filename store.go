@@ -26,6 +26,7 @@ const (
 	patchWindow   = 512              // newest records searched when a request path arrives after its usage
 	tailSize      = 100              // newest records kept in memory for the live panel
 	liveWindow    = 5 * time.Second  // a provider counts as active this long after a request finished
+	flameWindow   = time.Minute      // the topology's fire keeps flowing this long after a provider's latest request
 	errorWindow   = 10 * time.Second // how long the last failing provider stays highlighted (as in 9router)
 	authCacheTTL  = 30 * time.Second
 	maxErrorChars = 500
@@ -102,6 +103,11 @@ var errNotOpen = errors.New("usage history is not open")
 
 type pathNote struct{ trace, path string }
 
+type lastRequest struct {
+	arrived int64
+	failed  bool
+}
+
 // usageStore keeps the history in a SQLite database and only the newest records in memory.
 // ponytail: stats and charts scan every row of their period (~1.7 s per million rows for "all");
 // add hourly rollups when long periods get slow.
@@ -117,6 +123,7 @@ type usageStore struct {
 	pathPos     int
 	errProvider string
 	errAt       int64
+	latest      map[string]lastRequest // provider (lower case) -> its newest request, for the topology's fire
 
 	authMu  sync.Mutex
 	auths   []pluginapi.HostAuthFileEntry
@@ -175,7 +182,7 @@ func openDB(path string) (*sql.DB, error) {
 
 // loadLocked reads what stays in memory: the record count, the providers and keys, and the newest records.
 func (s *usageStore) loadLocked() error {
-	s.total, s.providers, s.apiKeys, s.tail = 0, map[string]bool{}, map[string]bool{}, nil
+	s.total, s.providers, s.apiKeys, s.tail, s.latest = 0, map[string]bool{}, map[string]bool{}, nil, map[string]lastRequest{}
 	if errCount := s.db.QueryRow("SELECT COUNT(*) FROM requests").Scan(&s.total); errCount != nil {
 		return errCount
 	}
@@ -345,6 +352,9 @@ func (s *usageStore) addUsage(u pluginapi.UsageRecord, account string, now time.
 		s.tail = slices.Clone(s.tail[len(s.tail)-tailSize:]) // trim now and then, not on every request
 	}
 	s.noteLocked(rec.Provider, rec.APIKey)
+	if rec.Provider != "" {
+		s.latest[strings.ToLower(rec.Provider)] = lastRequest{rec.arrived, rec.Failed}
+	}
 	if rec.Failed && rec.Provider != "" {
 		s.errProvider, s.errAt = strings.ToLower(rec.Provider), rec.arrived
 	}

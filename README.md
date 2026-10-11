@@ -70,11 +70,12 @@ key once and keeps it in this browser until **Forget key**.
 - Cost is an estimate from 9router's price table (`pricing.json`, USD per 1M tokens), not billing.
 - API key names: the panel lets you name client API keys (Config → Client API Keys → Edit) and keeps the
   names in that browser only. The page reads them there and shows the name, falling back to the masked key.
-- Topology: a solar system. CLIProxyAPI is the sun and each provider a planet on its own orbit, the busiest
-  closest. For 5 s after a provider serves a request, plasma in its colour streams from its planet into the
-  sun (red and broken if it failed). Plugins only hear about a request once it finishes, so there is no true
-  in-flight view. Drag to rotate and tilt, hold to pause, Shift + drag to pan, Ctrl/⌘ + scroll or the buttons
-  to zoom; select a planet to open its requests in Details.
+- Topology: CLIProxyAPI is drawn as the sun and each provider as a planet, with busier providers on the inner
+  orbits. For a minute after a provider serves a request, a stream of fire in its colour flows from its planet
+  into the sun. The fire is red and sputters if that request failed, and it dies down over the last 10 seconds.
+  Plugins only hear about a request once it finishes, so the map cannot show requests still in progress.
+  Drag to rotate and tilt, hold to pause, Shift + drag to pan, and use Ctrl/⌘ + scroll or the buttons to zoom.
+  Click a planet to open its requests in Details.
 
 ### Management API
 
@@ -84,7 +85,7 @@ All routes need the management key; `tz` (minutes east of UTC) sets the time zon
 |---|---|
 | `GET /v0/management/usage/stats?period=` | Usage rows, topology providers, live panel |
 | `GET /v0/management/usage/chart?period=` | Hourly (today, 24h) or daily buckets |
-| `GET /v0/management/usage/live` | Recent requests, active providers, last failing provider |
+| `GET /v0/management/usage/live` | Recent requests, active providers, how long each provider's fire keeps burning, last failing provider |
 | `GET /v0/management/usage/details?page&pageSize&provider&apiKey&from&to&snapshot` | Request history, newest first; `apiKey` is a masked key, `snapshot` the first page's `pagination.snapshot` |
 
 ## Release

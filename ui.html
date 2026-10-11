@@ -231,17 +231,16 @@ select.input { padding-right: 34px; appearance: none; cursor: pointer; backgroun
 .orbitPath.on { stroke: color-mix(in srgb, var(--c) 75%, var(--orbit)); stroke-width: 1.6; stroke-dasharray: none; }
 .orbitPath.last { stroke: var(--amber-color); stroke-width: 1.4; stroke-dasharray: none; opacity: .85; }
 .orbitPath.err { stroke: var(--viz-failure); stroke-width: 1.4; stroke-dasharray: none; }
-/* plasma: streams in the provider's colour flow from the planet into the sun's core */
+/* plasma: for a minute after a provider serves a request, a stream of fire in its colour flows from the
+   planet into the sun's core */
 .plasma { position: absolute; inset: 0; z-index: 1001; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .plasma { mix-blend-mode: screen; }
 .pg { display: none; }
-.pg.on, .pg.err { display: inline; }
-.pg.err { --c: var(--viz-failure) !important; } /* beats the inline provider colour */
-.plasmaGlow { fill: none; stroke: var(--c); stroke-width: 12; stroke-linecap: round; opacity: .38; }
-.strand { fill: none; stroke: color-mix(in srgb, var(--c) 72%, #fff); stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; opacity: .9; }
-.strand.core { stroke: color-mix(in srgb, var(--c) 28%, #fff); stroke-width: 1.3; opacity: .95; }
-.pg.err .strand { stroke-dasharray: 4 5; } /* a failure sputters, whatever the provider colour */
-.plasmaDot { fill: color-mix(in srgb, var(--c) 45%, #fff); }
+.pg.on { display: inline; }
+.pg.err { --c: var(--viz-failure) !important; } /* a failed request burns red, whatever the provider colour */
+.flameGlow { fill: none; stroke: var(--c); stroke-linecap: round; opacity: .42; }
+.fire circle { mix-blend-mode: screen; } /* overlapping puffs add up to a hot core */
+.spark { fill: color-mix(in srgb, var(--c) 40%, #fff); }
 .flare { fill: var(--c); opacity: .85; }
 .scene { position: absolute; inset: 0; pointer-events: none; }
 .sunWrap, .planet { position: absolute; left: 0; top: 0; width: 0; height: 0; will-change: transform; }
@@ -595,7 +594,9 @@ function sessionGet(k) { try { return sessionStorage.getItem(k) || ""; } catch {
 function sessionSet(k, v) { try { v ? sessionStorage.setItem(k, v) : sessionStorage.removeItem(k); } catch {} }
 
 // ---------- formatting ----------
-const numberFormat = new Intl.NumberFormat();
+// en-US, not the browser's locale, which would mix its own date order and separators into the English page.
+const numberFormat = new Intl.NumberFormat("en-US");
+const dateTimeFmt = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "medium" });
 const fmt = n => numberFormat.format(n || 0);
 const fmtCost = n => "$" + (n || 0).toFixed(2);
 const fmtMoney = n => "$" + (!n ? "0" : n >= 100 ? n.toFixed(0) : n >= 1 ? n.toFixed(2) : n.toFixed(4));
@@ -615,7 +616,7 @@ function fmtTime(ms) {
   if (mins < 1) return "Just now";
   if (mins < 60) return mins + "m ago";
   if (mins < 1440) return Math.floor(mins / 60) + "h ago";
-  return new Date(ms).toLocaleDateString();
+  return new Date(ms).toLocaleDateString("en-US", { dateStyle: "medium" });
 }
 function timeAgo(ms) {
   const diff = Math.max(0, Math.floor((Date.now() - ms) / 1000));
@@ -1032,9 +1033,9 @@ function buildOverview() {
   ui.table = h("div", { class: "tableWrap" });
   ui.sections = h("div", { class: "stack" },
     sectionBlock("Live topology", "Your providers in orbit",
-      "CLIProxyAPI is the sun. Each provider is a planet, the busiest on the inner orbits. When a provider serves a request, plasma in its colour streams into the sun; red plasma means its last request failed. Drag to rotate, hold to pause, Ctrl + scroll to zoom, and select a planet for its requests.", null,
+      "The sun in the middle is CLIProxyAPI, and each planet is one of your providers. The busier a provider is, the closer it orbits. When a provider handles a request, a stream of fire in its colour flows into the sun for a minute, and it turns red if the request failed. Click a planet to see its requests.", null,
       h("div", { class: "panel topoPanel" }, ui.topo)),
-    sectionBlock("Traffic", ui.trafficTitle, "Volume over the selected period, bucketed by hour for Today and 24h and by day otherwise, in your time zone.", null,
+    sectionBlock("Traffic", ui.trafficTitle, "This chart shows tokens, requests or cost for the selected period. Today and 24h are grouped by hour and longer periods by day, using your local time.", null,
       h("div", { class: "split" },
         h("div", { class: "panel" }, h("div", { class: "panelHead" }, ui.chartLegend, ui.chartToggle), ui.chart),
         h("div", { class: "panel recentPanel" }, h("div", { class: "panelHead" }, h("h3", { class: "panelTitle" }, "Recent requests"), ui.recentBadge), ui.recent))),
@@ -1043,7 +1044,7 @@ function buildOverview() {
         h("div", { class: "panel" }, h("div", { class: "panelHead" }, h("h3", { class: "panelTitle" }, "By provider"), ui.provToggle), ui.provChart),
         h("div", { class: "panel" }, h("div", { class: "panelHead" }, h("h3", { class: "panelTitle" }, "Top models"), ui.modelToggle), ui.modelChart))),
     sectionBlock("Ledger", "Usage by model, account, API key and endpoint",
-      "Open a row for its per-model split. Costs are split by token share and are estimates, not billing.", ui.tableTools, ui.table));
+      "Each row adds up one model, account, API key or endpoint. Click a row to see the models behind it. Costs are estimated from list prices, and the input, cached and output columns divide each total by token count, so they are approximate.", ui.tableTools, ui.table));
   ui.placeholder = h("div");
   ui.overview.replaceChildren(ui.tiles, ui.placeholder, ui.sections);
   bindSolar();
@@ -1219,7 +1220,10 @@ function buildSolar(providers) {
   const big = { filterUnits: "userSpaceOnUse", x: -4000, y: -4000, width: 8000, height: 8000 };
   const plasma = s("svg", { class: "plasma", "aria-hidden": "true" }, s("defs", {},
     s("filter", { id: "plasma-blur", ...big }, s("feGaussianBlur", { stdDeviation: 3.5 })),
-    s("filter", { id: "plasma-glow", ...big }, s("feGaussianBlur", { stdDeviation: 1.6, result: "b" }), s("feMerge", {}, s("feMergeNode", { in: "b" }), s("feMergeNode", { in: "SourceGraphic" }))),
+    // tears the fire's edges into tongues; the noise is stretched along the flow (x in the fire's frame)
+    s("filter", { id: "fire-warp", x: "-10%", y: "-80%", width: "120%", height: "260%" },
+      s("feTurbulence", { type: "fractalNoise", baseFrequency: `${FIRE_NOISE} ${FIRE_NOISE * 3}`, numOctaves: 2, seed: 4, result: "n" }),
+      s("feDisplacementMap", { in: "SourceGraphic", in2: "n", scale: 16, xChannelSelector: "R", yChannelSelector: "G" })),
     // slow noise that makes the sun's surface and prominence boil
     s("filter", { id: "sun-boil", x: "-5%", y: "-5%", width: "110%", height: "110%" },
       s("feTurbulence", { type: "fractalNoise", baseFrequency: "0.035", numOctaves: 2, seed: 9, result: "n" },
@@ -1234,10 +1238,15 @@ function buildSolar(providers) {
   order.forEach((id, i) => {
     const meta = providerMeta(id), r = solar.R0 + gap * i;
     const orbit = s("path", { class: "orbitPath", style: `--c:${meta.color}` });
-    const strands = [0, 1, 2].map(() => s("path", { class: "strand" })), core = s("path", { class: "strand core" });
-    const glow = s("path", { class: "plasmaGlow", filter: "url(#plasma-blur)" }), flare = s("circle", { class: "flare", filter: "url(#plasma-blur)" });
-    const dots = [0, 1, 2, 3].map(() => s("circle", { class: "plasmaDot", filter: "url(#plasma-glow)" }));
-    const pg = s("g", { class: "pg", style: `--c:${meta.color}` }, flare, glow, strands, core, dots);
+    const glow = s("path", { class: "flameGlow", filter: "url(#plasma-blur)" }), flare = s("circle", { class: "flare", filter: "url(#plasma-blur)" });
+    const circles = (n, attrs) => Array.from({ length: n }, () => s("circle", { r: 1, ...attrs })); // placed and stretched by a transform
+    const puffs = circles(FLAME_PUFFS, { fill: `url(#fire-${i})` }), hots = circles(FLAME_HOTS, { fill: `url(#fire-hot-${i})` }), sparks = circles(FLAME_SPARKS, { class: "spark" });
+    const fuel = s("g", {}, glow, puffs, hots), flow = s("g", { filter: "url(#fire-warp)" }, fuel);
+    const fire = s("g", { class: "fire" }, flow, sparks);
+    const pg = s("g", { class: "pg", style: `--c:${meta.color}` },
+      s("radialGradient", { id: `fire-${i}` }, gradientStops([["color-mix(in srgb, var(--c) 60%, #fff)", 0.85], ["var(--c)", 0.55], ["var(--c)", 0]])),
+      s("radialGradient", { id: `fire-hot-${i}` }, gradientStops([["#fff", 0.9], ["color-mix(in srgb, var(--c) 50%, #fff)", 0.5], ["var(--c)", 0]])),
+      flare, fire);
     orbits.append(orbit); plasma.append(pg);
     const body = h("div", { class: "pbody", tabindex: 0, role: "button", "aria-label": meta.name },
       h("span", { class: "phalo" }), h("span", { class: "psurf", style: `--sd:${((1.2 + i * 1.9) % 7.5).toFixed(1)}s` }),
@@ -1246,7 +1255,8 @@ function buildSolar(providers) {
     const label = h("div", { class: "plabel" }, h("b", {}, meta.name), sub);
     const el = h("div", { class: "planet idle", style: `--c:${meta.color}` }, body, label);
     scene.append(el);
-    const p = { id, meta, r, theta: 0.9 + i * 2.39996, omega: 0.14 * (solar.R0 / r), size: PLANET_SIZE, el, body, label, sub, orbit, pg, strands, core, glow, flare, dots, cls: "", x: 0, y: 0, sc: 1 };
+    const p = { id, meta, r, theta: 0.9 + i * 2.39996, omega: 0.14 * (solar.R0 / r), size: PLANET_SIZE, el, body, label, sub, orbit, pg, fire, flow, fuel, glow, flare, puffs, hots, sparks,
+      cls: "", flameUntil: 0, burning: false, x: 0, y: 0, sc: 1 };
     body.addEventListener("click", () => { if (!solar.moved) openProvider(id); });
     body.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); openProvider(id); } });
     body.addEventListener("pointerenter", () => { if (!solar.dragging) { solar.hover = p; showPlanetTip(p); } });
@@ -1264,7 +1274,7 @@ function buildSolar(providers) {
     h("button", { type: "button", title: "Reset view", "aria-label": "Reset view", onclick: resetSolar }, icon("fit", 14)),
     solar.pauseBtn);
   const legend = h("div", { class: "topoLegend", "aria-hidden": "true" },
-    h("span", {}, h("i", { class: "lg plasmaLg" }), "Live (plasma)"),
+    h("span", {}, h("i", { class: "lg plasmaLg" }), "Request in the last minute"),
     h("span", {}, h("i", { class: "lg", style: "--lg:var(--amber-color)" }), "Latest request"),
     h("span", {}, h("i", { class: "lg", style: "--lg:var(--viz-failure)" }), "Failed"),
     h("span", {}, h("i", { class: "lg dash" }), "No traffic"),
@@ -1331,38 +1341,62 @@ function solarFrame(now) {
     p.el.style.opacity = (0.74 + 0.26 * near).toFixed(2);
     p.body.style.cssText = `--s:${sc.toFixed(3)};--lx:${(50 + (off * dx) / len).toFixed(1)}%;--ly:${(50 + (off * dy) / len).toFixed(1)}%`;
     p.label.style.transform = `translate(-50%, ${(32 * sc + 7).toFixed(1)}px)`;
-    if (p.cls === "on" || p.cls === "err") drawPlasma(p, sun, now, sunScale);
+    const life = p.flameUntil - now, burning = life > 0;
+    if (burning !== p.burning) { p.burning = burning; p.pg.classList.toggle("on", burning); }
+    if (burning) drawFlame(p, sun, now, sunScale, life);
   }
   if (solar.hover && !ui.topoTip.hidden) positionTip(solar.hover);
   solar.stars.style.transform = `translate(-50%, -50%) translateY(${((solar.elev - defaultElev()) * 160).toFixed(1)}px) rotate(${solar.yaw.toFixed(4)}rad)`;
   solar.raf = requestAnimationFrame(solarFrame);
 }
-// Three wavy strands, a bright core and particles run from the planet's sunward edge into the sun's
-// centre; the waves travel toward the sun. Failures sputter in red.
-function drawPlasma(p, sun, now, sunScale) {
-  const err = p.cls === "err", t0 = reducedMotion.matches ? 0 : now, SEG = 28;
-  const dx = sun.x - p.x, dy = sun.y - p.y, len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len;
-  const r0 = 30 * p.sc, x0 = p.x + ux * r0, y0 = p.y + uy * r0, L = Math.max(1, len - r0);
-  const flick = err ? 0.55 + 0.45 * Math.abs(Math.sin(t0 / 53) * Math.sin(t0 / 91)) : 1;
-  const at = (t, amp, waves, speed, phase) => {
-    const off = amp * Math.sin(Math.PI * t) * (Math.sin(waves * 2 * Math.PI * t - t0 * speed + phase) + 0.35 * Math.sin(waves * 5.3 * Math.PI * t - t0 * speed * 2.2 + phase * 1.7));
-    return [x0 + ux * L * t - uy * off, y0 + uy * L * t + ux * off];
-  };
-  const path = (amp, waves, speed, phase) => {
-    let d = "";
-    for (let i = 0; i <= SEG; i++) { const [x, y] = at(i / SEG, amp, waves, speed, phase); d += (i ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1); }
-    return d;
-  };
-  const amp = Math.min(16, 6 + L / 18) * flick;
-  p.strands.forEach((el, k) => el.setAttribute("d", path(amp * (1 - k * 0.22), 1.3 + k * 0.55, 0.005 + k * 0.0016, k * 2.1)));
-  const core = path(amp * 0.25, 2, 0.007, 0.5);
-  p.core.setAttribute("d", core);
-  p.glow.setAttribute("d", core);
-  p.dots.forEach((el, i) => {
-    const t = (t0 / (err ? 1400 : 1000) + i / p.dots.length) % 1, [x, y] = at(t, amp * 0.6, 1.3, 0.005, 0);
-    el.setAttribute("cx", x.toFixed(1)); el.setAttribute("cy", y.toFixed(1));
-    el.setAttribute("r", (3.2 * (1 - 0.5 * t)).toFixed(2)); // absorbed as it reaches the core
+// The fire: soft puffs, stretched along the flow, run from the planet's sunward edge into the sun's core and
+// narrow as they go, hotter puffs burn near the middle, and a noise warp that drifts with the flow tears the
+// edges into tongues; sparks fly off the sides. A failed request burns red and sputters. In its last
+// FLAME_FADE ms the fire dies down. Sizes are in the planet's units, so the fire scales with the zoom.
+const FLAME_PUFFS = 40, FLAME_HOTS = 18, FLAME_SPARKS = 10, FLAME_FADE = 10000;
+const FIRE_NOISE = 0.032, FIRE_NOISE_PERIOD = 256 / FIRE_NOISE; // SVG noise repeats every 256 cells, so the drift wraps seamlessly
+const gradientStops = list => list.map(([color, alpha], k) => s("stop", { offset: k / (list.length - 1), style: `stop-color:${color};stop-opacity:${alpha}` }));
+const hash = n => { const x = Math.sin(n) * 43758.5453; return x - Math.floor(x); }; // stable 0..1 noise per particle and trip
+function drawFlame(p, sun, now, sunScale, life) {
+  const err = p.pg.classList.contains("err"), t0 = reducedMotion.matches ? 0 : now, SEG = 24;
+  const dx = sun.x - p.x, dy = sun.y - p.y, len = Math.hypot(dx, dy) || 1, k = p.sc, r0 = 24 * k, L = Math.max(1, len - r0) / k;
+  // the fire's frame: x runs from the planet's edge (0) to the sun's centre (L), in planet units
+  p.fire.setAttribute("transform", `translate(${(p.x + (dx / len) * r0).toFixed(1)},${(p.y + (dy / len) * r0).toFixed(1)}) rotate(${((Math.atan2(dy, dx) * 180) / Math.PI).toFixed(2)}) scale(${k.toFixed(3)})`);
+  const drift = ((t0 * (err ? 0.07 : 0.11)) % FIRE_NOISE_PERIOD).toFixed(1); // the noise flows toward the sun, the fire stays put
+  p.flow.setAttribute("transform", `translate(${drift},0)`);
+  p.fuel.setAttribute("transform", `translate(${-drift},0)`);
+  const fade = Math.min(1, life / FLAME_FADE), W = 17 * (0.4 + 0.6 * fade); // half-width at the planet
+  const amp = Math.min(9, 2 + L / 45), wave = t0 * (err ? 0.0022 : 0.0034);
+  const mid = t => amp * Math.sin(Math.PI * t) * Math.sin(2 * Math.PI * t - wave);
+  const width = t => W * (1 - 0.6 * t); // narrows into the core
+  let d = "";
+  for (let i = 0; i <= SEG; i++) d += (i ? "L" : "M") + ((i / SEG) * L).toFixed(1) + "," + mid(i / SEG).toFixed(1);
+  p.glow.setAttribute("d", d);
+  p.glow.setAttribute("stroke-width", (W * 2.6).toFixed(1));
+  // Each particle crosses in `period` ms; i / n spaces them evenly and the hash varies every trip.
+  const move = (els, period, n, place) => els.forEach((el, i) => {
+    const u = t0 / period + (i + hash(i * 12.99 + n)) / els.length, trip = Math.floor(u), t = u - trip;
+    const a = hash(i * 78.23 + trip * 3.71 + n), b = hash(i * 39.43 + trip * 1.37 + n);
+    const [side, rx, ry, alpha] = place(t, a, b, i);
+    const shown = err && b < 0.3 ? 0 : Math.max(0, Math.min(1, alpha)); // a failure sputters
+    el.setAttribute("transform", `matrix(${rx.toFixed(2)},0,0,${ry.toFixed(2)},${(t * L).toFixed(1)},${(mid(t) + side).toFixed(1)})`);
+    el.setAttribute("opacity", shown.toFixed(2));
   });
+  const ends = (t, tail) => Math.min(1, t / 0.06) * Math.min(1, (1 - t) / tail); // fade in at the planet, out in the core
+  const flicker = (a, i) => 0.8 + 0.2 * Math.sin(t0 / 65 + a * 9 + i);
+  move(p.puffs, err ? 1700 : 1300, 1, (t, a, b, i) => {
+    const r = width(t) * (0.7 + 0.5 * b) * flicker(a, i);
+    return [(a * 2 - 1) * width(t) * 0.5, r * 2.2, r, ends(t, 0.28)];
+  });
+  move(p.hots, err ? 1500 : 1050, 2, (t, a, b, i) => {
+    const r = width(t) * (0.36 + 0.28 * b) * flicker(b, i);
+    return [(a * 2 - 1) * width(t) * 0.2, r * 2.6, r, ends(t, 0.4) * 0.95];
+  });
+  move(p.sparks, err ? 1300 : 900, 3, (t, a, b) => {
+    const r = 2.2 * (1.25 - t) * (0.6 + 0.6 * b);
+    return [(a * 2 - 1) * W * (0.6 + 2.6 * t), r, r, ends(t, 0.9) * (1 - t)];
+  });
+  p.pg.style.opacity = fade.toFixed(3);
   p.flare.setAttribute("cx", sun.x.toFixed(1)); p.flare.setAttribute("cy", sun.y.toFixed(1));
   p.flare.setAttribute("r", (SUN * 0.3 * sunScale * (0.85 + 0.2 * Math.sin(t0 / 160 + p.r))).toFixed(1));
 }
@@ -1372,7 +1406,11 @@ function updateSolar() {
   const recent = st.recentRequests || [];
   const last = String((recent[0] && recent[0].provider) || "").toLowerCase();
   const error = String(st.errorProvider || "").toLowerCase();
+  const flames = st.flames || {}, clock = performance.now();
   for (const p of solar.planets) {
+    const f = flames[p.id];
+    p.flameUntil = f ? clock + f.left : 0;
+    p.pg.classList.toggle("err", !!(f && f.failed));
     const u = totals.byProvider[p.id];
     const share = u && totals.totalRequests ? u.requests / totals.totalRequests : 0;
     const cls = active.has(p.id) ? "on" : error === p.id ? "err" : last === p.id ? "last" : u ? "used" : "idle";
@@ -1382,7 +1420,6 @@ function updateSolar() {
     p.cls = cls;
     p.el.className = "planet " + cls;
     p.orbit.setAttribute("class", "orbitPath " + cls);
-    p.pg.setAttribute("class", "pg " + cls);
   }
   const live = [...active.values()].reduce((a, b) => a + b, 0);
   solar.sunBody.classList.toggle("on", live > 0);
@@ -1884,7 +1921,7 @@ function renderDetailsTable() {
   if (d.loading) body = h("tr", {}, td(h("span", { style: "display:inline-flex;align-items:center;gap:8px" }, spinner(), "Loading…"), "empty", { colspan: head.length }));
   else if (!d.items.length) body = h("tr", {}, td("No request details found", "empty", { colspan: head.length }));
   else body = d.items.map(r => h("tr", {},
-    td(h("span", { style: "display:inline-flex;align-items:center;gap:10px" }, h("span", { class: "dot" + (r.failed ? " bad" : ""), title: r.failed ? "Failed" : "Succeeded" }), new Date(r.ts).toLocaleString())),
+    td(h("span", { style: "display:inline-flex;align-items:center;gap:10px" }, h("span", { class: "dot" + (r.failed ? " bad" : ""), title: r.failed ? "Failed" : "Succeeded" }), dateTimeFmt.format(r.ts))),
     td(h("span", { class: "mono trunc", style: "display:block;max-width:260px", title: r.model }, r.model)),
     td(providerChip(r.provider)),
     td(fmt(r.input), "r num"),
@@ -1940,7 +1977,7 @@ function openSheet(r) {
   const mono = v => h("span", { class: "mono" }, v);
   const specs = [
     spec("Status", h("span", { class: "pill" + (r.failed ? " bad" : "") }, r.failed ? "Failed" + (r.status ? " " + r.status : "") : "Success")),
-    spec("Time", new Date(r.ts).toLocaleString()),
+    spec("Time", dateTimeFmt.format(r.ts)),
     spec("Provider", providerChip(r.provider)),
     spec("Model", mono(r.model + (r.alias ? ` (alias ${r.alias})` : ""))),
     spec("Time to first token", mono(fmt(r.ttft_ms || 0) + " ms")),
@@ -1963,7 +2000,7 @@ function openSheet(r) {
     h("div", { class: "sheet", role: "dialog", "aria-modal": "true", "aria-label": "Request details", tabindex: -1 },
       h("div", { class: "sheetHead" },
         h("span", { class: "sheetEyebrow" }, "Request"), h("h2", { class: "sheetTitle" }, r.model || "Unknown model"),
-        h("p", { class: "sheetDesc" }, `${providerMeta(r.provider).name} · ${new Date(r.ts).toLocaleString()}`),
+        h("p", { class: "sheetDesc" }, `${providerMeta(r.provider).name} · ${dateTimeFmt.format(r.ts)}`),
         h("button", { type: "button", class: "closeBtn", "aria-label": "Close", onclick: close }, icon("close", 18))),
       h("div", { class: "sheetBody" },
         h("div", { class: "specGrid" }, specs),

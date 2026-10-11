@@ -242,6 +242,28 @@ func TestDetailsSnapshotAndKeyFilter(t *testing.T) {
 	}
 }
 
+func TestFlamesLastAMinute(t *testing.T) {
+	s := &usageStore{}
+	if errOpen := s.open(filepath.Join(t.TempDir(), "usage.db")); errOpen != nil {
+		t.Fatal(errOpen)
+	}
+	defer s.close()
+	now := time.Now()
+	add := func(provider string, failed bool, at time.Time) {
+		s.addUsage(pluginapi.UsageRecord{Provider: provider, Model: "gpt-5", Generate: true, Failed: failed, RequestedAt: at}, "", at)
+	}
+	add("xai", false, now.Add(-50*time.Second))
+	add("xai", true, now.Add(-40*time.Second)) // the latest request decides the colour
+	add("Codex", false, now)
+	flames := s.live(now).Flames
+	if len(flames) != 2 || flames["codex"].Left != 60_000 || flames["codex"].Failed || flames["xai"].Left != 20_000 || !flames["xai"].Failed {
+		t.Fatalf("flames = %+v", flames)
+	}
+	if flames = s.live(now.Add(time.Minute)).Flames; len(flames) != 0 {
+		t.Fatalf("flames a minute later = %+v", flames)
+	}
+}
+
 // must unwraps a query result.
 func must[T any](v T, err error) T {
 	if err != nil {

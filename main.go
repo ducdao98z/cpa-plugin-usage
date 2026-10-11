@@ -75,7 +75,7 @@ const (
 )
 
 // pluginVersion is set from the release tag with -ldflags "-X main.pluginVersion=...".
-var pluginVersion = "0.5.0"
+var pluginVersion = "0.5.2"
 
 var store = &usageStore{}
 
@@ -220,7 +220,7 @@ func pluginRegistration() registration {
 			Author:           "ducdao98z",
 			GitHubRepository: repositoryURL,
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "data-file", Type: pluginapi.ConfigFieldTypeString, Description: "Usage history database (SQLite). Default: " + defaultDataFile + " (relative to the CLIProxyAPI working directory); a .jsonl history of the same name (before 0.4.0) is imported once."},
+				{Name: "data-file", Type: pluginapi.ConfigFieldTypeString, Description: "Path of the SQLite database that keeps the usage history. Leave it empty to use " + defaultDataFile + ", relative to the CLIProxyAPI working directory. A .jsonl history with the same name, from versions before 0.4.0, is imported on first start."},
 			},
 		},
 		Capabilities: registrationCapability{

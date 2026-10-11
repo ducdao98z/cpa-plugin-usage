@@ -39,17 +39,17 @@ type resourceRoute struct {
 }
 
 func managementRegistration() map[string]any {
-	resources := []resourceRoute{{Path: "/ui", Menu: displayName, Description: "Usage and analytics: overview, charts, provider topology, request details and logs."}}
+	resources := []resourceRoute{{Path: "/ui", Menu: displayName, Description: "Token usage, estimated cost and traffic for each provider, with a live provider map, request history and logs."}}
 	entries, _ := icons.ReadDir("icons")
 	for _, e := range entries {
 		resources = append(resources, resourceRoute{Path: "/icons/" + e.Name()})
 	}
 	return map[string]any{
 		"routes": []managementRoute{
-			{Method: http.MethodGet, Path: apiBase + "/stats", Description: "Usage rows and live panel for ?period=today|24h|7d|30d|60d|all (tz = viewer offset in minutes east of UTC)."},
-			{Method: http.MethodGet, Path: apiBase + "/chart", Description: "Token, request and cost buckets for ?period (hourly for today/24h, daily otherwise)."},
-			{Method: http.MethodGet, Path: apiBase + "/live", Description: "Recent requests, providers that just served a request, and the last failing provider."},
-			{Method: http.MethodGet, Path: apiBase + "/details", Description: "Request history, newest first (?page, pageSize<=200, provider, apiKey as masked, from, to as RFC 3339, snapshot from the first page's pagination so later pages stay put)."},
+			{Method: http.MethodGet, Path: apiBase + "/stats", Description: "Usage totals for a period (today, 24h, 7d, 30d, 60d or all) and the live data shown on the page. tz is the viewer's offset from UTC in minutes."},
+			{Method: http.MethodGet, Path: apiBase + "/chart", Description: "Tokens, requests and cost for a period, grouped by hour for today and 24h and by day otherwise."},
+			{Method: http.MethodGet, Path: apiBase + "/live", Description: "The latest requests, the providers that served a request recently, and the last provider that failed."},
+			{Method: http.MethodGet, Path: apiBase + "/details", Description: "Request history, newest first. Filter by provider, apiKey (masked) and from/to (RFC 3339). Page with page and pageSize (up to 200), and send back the snapshot from page 1 so later pages do not shift when new requests arrive."},
 		},
 		"resources": resources,
 	}
